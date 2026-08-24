@@ -147,23 +147,14 @@ def patch_manifest(data):
             if val==0x0101021b:
                 struct.pack_into('<I',p,offset+4,ri(1,9999))
                 break
-        # package link_size (safe cosmetic)
-        if len(p)>12:
-            struct.pack_into('<I',p,8,ri(0,0xFFF))
         return bytes(p)
     except Exception:
         return data
 
 # ══ LAYER 5: ARSC PATCH ══════════════════════════════════════
 def patch_arsc(data):
-    try:
-        if len(data)<300: return data
-        p=bytearray(data)
-        for i in range(280,min(300,len(p))):
-            p[i]=random.randint(0,255)
-        return bytes(p)
-    except Exception:
-        return data
+    # skip arsc patch — can corrupt resources
+    return data
 
 # ══ LAYER 6: NATIVE SO ═══════════════════════════════════════
 def make_elf(bits=64):
@@ -226,12 +217,11 @@ def process_apk(input_path,output_path):
                     try: data=inp.read(name)
                     except Exception: continue
 
-                    # layer 2+3: smali obfuscate (safe only)
+                    # layer 2: smali string obfuscate only
                     if name.endswith(".smali"):
                         try:
                             content=data.decode('utf-8','ignore')
                             content=obfuscate_smali_safe(content)
-                            content=split_strings_safe(content)
                             data=content.encode('utf-8')
                             stats["smali"]+=1
                         except Exception: pass
